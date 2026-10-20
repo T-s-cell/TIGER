@@ -101,6 +101,12 @@ def reload_check(model, config, save_path, code_path, dataset_path, device, ref_
     input_ids = torch.from_numpy(ref['input_ids']).to(device)
     attention_mask = torch.from_numpy(ref['attention_mask']).to(device)
     labels = torch.from_numpy(ref['labels']).to(device)
+    # the reference beam outputs were produced with a fixed beam width; derive
+    # it so the comparison cannot be skewed by a mismatched --beam_size
+    ref_beam = ref['preds'].shape[0] // ref['input_ids'].shape[0]
+    if ref_beam != beam_size:
+        print(f"note: reference was saved with beam_size={ref_beam} (arg {beam_size}); using {ref_beam}")
+        beam_size = ref_beam
     with torch.no_grad():
         _, logits = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
         preds = model.generate(input_ids=input_ids, attention_mask=attention_mask, num_beams=beam_size)
