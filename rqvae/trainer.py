@@ -97,8 +97,12 @@ class Trainer(object):
         elif learner.lower() == "sgd":
             optimizer = optim.SGD(params, lr=learning_rate, weight_decay=weight_decay)
         elif learner.lower() == "adagrad":
+            # assumption params (paper gives only lr): initial_accumulator_value
+            # and eps follow the common PyTorch recipe, lr_decay disabled
             optimizer = optim.Adagrad(
-                params, lr=learning_rate, weight_decay=weight_decay
+                params, lr=learning_rate, lr_decay=0.0,
+                weight_decay=weight_decay,
+                initial_accumulator_value=0.1, eps=1e-7,
             )
             for state in optimizer.state.values():
                 for k, v in state.items():
@@ -120,6 +124,8 @@ class Trainer(object):
         return optimizer
 
     def _get_scheduler(self):
+        if self.lr_scheduler_type.lower() == "constant":
+            return None
         if self.lr_scheduler_type.lower() == "linear":
             lr_scheduler = get_linear_schedule_with_warmup(optimizer=self.optimizer,
                                                            num_warmup_steps=self.warmup_steps,
@@ -140,6 +146,8 @@ class Trainer(object):
 
         total_loss = 0
         total_recon_loss = 0
+        total_codebook_loss = 0
+        total_commit_loss = 0
         iter_data = tqdm(
                     train_data,
                     total=len(train_data),
@@ -161,15 +169,20 @@ class Trainer(object):
                 init_flags_before = [vq.initted for vq in self.model.rq.vq_layers]
             data = data.to(self.device)
             self.optimizer.zero_grad()
-            out, rq_loss, indices = self.model(data)
+            out, rq_loss, indices, layer_losses = self.model(data)
             loss, loss_recon = self.model.compute_loss(out, rq_loss, xs=data)
             self._check_nan(loss)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            total_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            if not torch.isfinite(total_grad_norm):
+                raise ValueError("Gradient norm is not finite (nan/inf)")
             self.optimizer.step()
-            self.scheduler.step()
             self.total_optimizer_steps += 1
-            lr_this_epoch = self.scheduler.get_last_lr()[0]
+            if self.scheduler is not None:
+                self.scheduler.step()
+                lr_this_epoch = self.scheduler.get_last_lr()[0]
+            else:
+                lr_this_epoch = self.optimizer.param_groups[0]["lr"]
             if batch_idx == 0 and self.records["first_batch_wall"] is None:
                 self._sync()
                 self.records["first_batch_wall"] = time() - t_fwd0
@@ -192,6 +205,8 @@ class Trainer(object):
             # print(self.scheduler.get_last_lr())
             total_loss += loss.item()
             total_recon_loss += loss_recon.item()
+            total_codebook_loss += sum(ll["codebook"].item() for ll in layer_losses)
+            total_commit_loss += sum(ll["commitment"].item() for ll in layer_losses)
 
         self._sync()
         epoch_time = time() - epoch_start
@@ -203,10 +218,14 @@ class Trainer(object):
             "lr_last": lr_this_epoch,
             "loss": total_loss,
             "recon_loss": total_recon_loss,
+            "codebook_loss": total_codebook_loss,
+            "commit_loss": total_commit_loss,
         })
         self.logger.info(
             f"epoch {epoch_idx} wall {epoch_time:.3f}s steps {self.total_optimizer_steps} "
-            f"lr {lr_this_epoch:.6g} loss {total_loss:.4f}"
+            f"lr {lr_this_epoch:.6g} loss {total_loss:.4f} "
+            f"recon {total_recon_loss:.4f} codebook {total_codebook_loss:.4f} "
+            f"commit(incl beta) {total_commit_loss:.4f}"
         )
 
         return total_loss, total_recon_loss
@@ -225,18 +244,23 @@ class Trainer(object):
 
         indices_set = set()
         num_sample = 0
+        layer_unique = [set() for _ in range(self.model.rq.num_quantizers)]
         for batch_idx, data in enumerate(iter_data):
             num_sample += len(data)
             data = data.to(self.device)
             indices = self.model.get_indices(data)
             indices = indices.view(-1,indices.shape[-1]).cpu().numpy()
+            for li in range(indices.shape[-1]):
+                layer_unique[li].update(indices[:, li].tolist())
             for index in indices:
                 code = "-".join([str(int(_)) for _ in index])
                 indices_set.add(code)
 
         collision_rate = (num_sample - len(list(indices_set)))/num_sample
+        n_e = self.model.rq.vq_layers[0].n_e
+        layer_usage = [round(len(s) / n_e, 4) for s in layer_unique]
 
-        return collision_rate
+        return collision_rate, layer_usage
 
     def _save_checkpoint(self, epoch, collision_rate=1, ckpt_file=None):
 
@@ -289,7 +313,7 @@ class Trainer(object):
             # eval
             if (epoch_idx + 1) % self.eval_step == 0:
                 valid_start_time = time()
-                collision_rate = self._valid_epoch(data)
+                collision_rate, layer_usage = self._valid_epoch(data)
 
                 if train_loss < self.best_loss:
                     self.best_loss = train_loss
@@ -315,9 +339,11 @@ class Trainer(object):
                 ) % (epoch_idx, valid_end_time - valid_start_time, collision_rate)
 
                 self.logger.info(valid_score_output)
+                self.records["final_layer_usage"] = layer_usage
                 self.records.setdefault("validations", []).append({
                     "epoch": epoch_idx,
                     "collision_rate": collision_rate,
+                    "layer_usage": layer_usage,
                     "wall_sec": round(valid_end_time - valid_start_time, 3),
                 })
                 ckpt_path = self._save_checkpoint(epoch_idx, collision_rate=collision_rate)
@@ -342,6 +368,12 @@ class Trainer(object):
         self.records["total_optimizer_steps"] = self.total_optimizer_steps
         self.records["best_loss"] = float(self.best_loss) if np.isfinite(self.best_loss) else None
         self.records["best_collision_rate"] = float(self.best_collision_rate) if np.isfinite(self.best_collision_rate) else None
+        self.records["loss_reduction"] = {
+            "recon": "per-sample feature-dim sum, then batch mean",
+            "quant": "sum over layers of (codebook + beta*commitment), same reduction",
+        }
+        final_path = self._save_checkpoint(epoch=self.epochs - 1, ckpt_file="final_model.pth")
+        self.records["final_model_path"] = final_path
         stats_path = os.path.join(self.ckpt_dir, "train_stats.json")
         with open(stats_path, "w") as f:
             json.dump(self.records, f, indent=2)

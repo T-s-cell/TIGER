@@ -9,14 +9,13 @@ from time import time
 from torch.utils.data import DataLoader, Dataset
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import LambdaLR
 import math
 import argparse
 import random
 import pandas as pd
 from tqdm import tqdm
 import logging
-from dataset import GenRecDataset
+from dataset import GenRecDataset, build_user_bucket_map, save_user_bucket_map
 from dataloader import GenRecDataLoader
 
 class TIGER(nn.Module):
@@ -99,36 +98,71 @@ def ndcg_at_k(pos_index, k):
   dcg = torch.where(pos_index, dcg, torch.tensor(0.0, dtype=torch.float, device=dcg.device))
   return dcg[:, :k].sum(dim=1).cpu().float()
 
-def train(model, train_loader, optimizer, device):
+def lr_at_step(step, lr, constant_steps):
+    """lr(s) = lr * min(1, sqrt(constant_steps / max(s, 1))): constant for the
+    first `constant_steps` steps, then inverse-sqrt decay (paper §4.1)."""
+    return lr * min(1.0, math.sqrt(constant_steps / max(step, 1)))
+
+def train_steps(model, train_loader, optimizer, device, max_steps, log_every,
+                lr, lr_constant_steps):
+    """Train for exactly max_steps optimizer steps (paper: 200k), cycling the
+    shuffled train loader. The LR is written directly into param_groups['lr']
+    before each optimizer.step() (torch Adam reads group lr every step; no
+    scheduler, no off-by-one)."""
     model.train()
-    total_loss = 0.0
-    n_steps = 0
+    loss_history = []
+    running = 0.0
+    running_n = 0
+    step = 0
     if device.type == 'cuda':
         torch.cuda.synchronize()
     t_start = time()
-    for batch in tqdm(train_loader, desc="Training"):
-        input_ids = batch['history'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        labels = batch['target'].to(device)
+    progress = tqdm(total=max_steps, desc="Training")
+    while step < max_steps:
+        for batch in train_loader:
+            if step >= max_steps:
+                break
+            step += 1
+            lr_s = lr_at_step(step, lr, lr_constant_steps)
+            for group in optimizer.param_groups:
+                group['lr'] = lr_s
+            input_ids = batch['history'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['target'].to(device)
 
-        optimizer.zero_grad()
-        loss, _ = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-        loss.backward()
-        optimizer.step()
+            optimizer.zero_grad()
+            loss, _ = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            if not torch.isfinite(loss):
+                raise ValueError(f"FATAL: loss is not finite (nan/inf) at step {step}")
+            loss.backward()
+            optimizer.step()
 
-        total_loss += loss.item()
-        n_steps += 1
+            running += loss.item()
+            running_n += 1
+            progress.update(1)
+            if step % log_every == 0 or step == max_steps:
+                loss_history.append({'step': step, 'loss_since_last': running / running_n,
+                                     'lr': lr_s})
+                running = 0.0
+                running_n = 0
+    progress.close()
     if device.type == 'cuda':
         torch.cuda.synchronize()
     wall = time() - t_start
-    return total_loss / len(train_loader), n_steps, wall
+    return loss_history, step, wall
 
-def evaluate(model, eval_loader, topk_list, beam_size, device, return_per_sample=False):
+def evaluate(model, eval_loader, topk_list, beam_size, device, return_per_sample=False,
+             code_to_item=None):
     """Original batch-mean metrics plus sample-weighted metrics (distinct names).
 
     The original code averaged per-batch means, which mis-weights the final
     short batch; the SampleWeighted_* metrics are computed per sample and are
     the trustworthy aggregate. Batch-mean values are kept for comparability.
+
+    With code_to_item, generated 4-token IDs that do not map to any item are
+    counted as illegal: they keep their rank position and count as a miss
+    (implementation assumption for this precheck), and the illegal rate
+    (illegal candidates / all candidates) is reported.
     """
     model.eval()
     recalls = {'Recall@' + str(k): [] for k in topk_list}
@@ -136,6 +170,8 @@ def evaluate(model, eval_loader, topk_list, beam_size, device, return_per_sample
     sw_hit = {'SampleWeighted_Recall@' + str(k): 0.0 for k in topk_list}
     sw_dcg = {'SampleWeighted_NDCG@' + str(k): 0.0 for k in topk_list}
     n_samples = 0
+    n_candidates = 0
+    n_illegal = 0
     per_sample = []
 
     if device.type == 'cuda':
@@ -150,6 +186,12 @@ def evaluate(model, eval_loader, topk_list, beam_size, device, return_per_sample
             preds = model.generate(input_ids=input_ids, attention_mask=attention_mask, num_beams=beam_size)
             preds = preds[:, 1:]  # Exclude the start token
             preds = preds.reshape(input_ids.shape[0], beam_size, -1)  # (batch_size, beam_size, seq_len)
+            if code_to_item is not None:
+                for row in preds.detach().cpu().tolist():
+                    for cand in row:
+                        n_candidates += 1
+                        if tuple(cand) not in code_to_item:
+                            n_illegal += 1
             pos_index = calculate_pos_index(preds, labels, maxk=beam_size)
             n_samples += pos_index.shape[0]
             for k in topk_list:
@@ -172,9 +214,13 @@ def evaluate(model, eval_loader, topk_list, beam_size, device, return_per_sample
     # Sample-weighted over all samples
     sw_recalls = {k: v / n_samples for k, v in sw_hit.items()}
     sw_ndcgs = {k: v / n_samples for k, v in sw_dcg.items()}
+    illegal_stats = None
+    if code_to_item is not None:
+        illegal_stats = {'n_candidates': n_candidates, 'n_illegal': n_illegal,
+                         'illegal_rate': n_illegal / max(n_candidates, 1)}
     if return_per_sample:
-        return avg_recalls, avg_ndcgs, sw_recalls, sw_ndcgs, wall, n_samples, torch.cat(per_sample, dim=0)
-    return avg_recalls, avg_ndcgs, sw_recalls, sw_ndcgs, wall, n_samples
+        return avg_recalls, avg_ndcgs, sw_recalls, sw_ndcgs, wall, n_samples, torch.cat(per_sample, dim=0), illegal_stats
+    return avg_recalls, avg_ndcgs, sw_recalls, sw_ndcgs, wall, n_samples, illegal_stats
 
 def set_seed(seed):
     """Set random seed for reproducibility."""
@@ -194,12 +240,13 @@ def sha256_file(path, chunk_size=1 << 20):
             h.update(chunk)
     return h.hexdigest()
 
-def save_checkpoint(path, model, config, epoch, codes_sha256):
+def save_checkpoint(path, model, config, step, codes_sha256, user_map_sha256):
     torch.save({
         'state_dict': model.state_dict(),
         'config': {k: v for k, v in config.items()},
-        'epoch': epoch,
+        'step': step,
         'codes_sha256': codes_sha256,
+        'user_map_sha256': user_map_sha256,
     }, path)
 
 def save_reference_outputs(path, model, fixed_batch, beam_size, device):
@@ -232,8 +279,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TIGER configuration")
     parser.add_argument('--batch_size', type=int, default=256, help='Batch size for training')
     parser.add_argument('--infer_size', type=int, default=96, help='Inference size for generating recommendations')
-    parser.add_argument('--num_epochs', type=int, default=200, help='Number of epochs for training')
-    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate for the optimizer')
+    parser.add_argument('--max_steps', type=int, default=1000, help='Optimizer steps to train (paper: 200000)')
+    parser.add_argument('--lr', type=float, default=0.01, help='Peak learning rate (paper: 0.01)')
+    parser.add_argument('--lr_constant_steps', type=int, default=10000, help='Steps with constant lr before inverse-sqrt decay (paper: 10000)')
+    parser.add_argument('--log_every', type=int, default=100, help='Record running loss every N steps')
     parser.add_argument('--device', type=str, default='cuda', help='Device to run the model on (e.g., "cuda" or "cpu")')
     parser.add_argument('--num_layers', type=int, default=4, help='Number of layers in the model')
     parser.add_argument('--num_decoder_layers', type=int, default=4, help='Number of decoder layers in the model')
@@ -242,18 +291,17 @@ if __name__ == "__main__":
     parser.add_argument('--num_heads', type=int, default=6, help='Number of attention heads')
     parser.add_argument('--d_kv', type=int, default=64, help='Dimension of key and value vectors')
     parser.add_argument('--dropout_rate', type=float, default=0.1, help='Dropout rate')
-    parser.add_argument('--vocab_size', type=int, default=1025, help='Vocabulary size')
+    parser.add_argument('--vocab_size', type=int, default=3025, help='Vocabulary size (1 PAD/BOS + 1024 item + 2000 user tokens)')
     parser.add_argument('--pad_token_id', type=int, default=0, help='Padding token ID')
     parser.add_argument('--eos_token_id', type=int, default=0, help='End of sequence token ID')
     parser.add_argument('--feed_forward_proj', type=str, default='relu', help='Feed forward projection type')
     parser.add_argument('--max_len', type=int, default=20, help='Maximum length for padding or truncation')
     parser.add_argument('--dataset_path', type=str, default='../data/Beauty', help='Path to the dataset')
     parser.add_argument('--code_path', type=str, default='../data/Beauty/Beauty_t5_rqvae.npy', help='Path to the item-to-code mapping file')
-    parser.add_argument('--mode', type=str, default='train', choices=['train', 'evaluation'], help='Mode of operation (kept for CLI compatibility; independent evaluation lives in evaluate.py)')
+    parser.add_argument('--user_mapping_path', type=str, required=True, help='user_mapping.npy from preprocess.py')
     parser.add_argument('--log_path', type=str, default='./logs/tiger.log', help='Path to the log file')
     parser.add_argument('--seed', type=int, default=2025, help='Random seed for reproducibility')
     parser.add_argument('--save_path', type=str, default='./ckpt/tiger.pth', help='Path to save the trained model')
-    parser.add_argument('--early_stop', type=int, default=10, help='Early stopping patience')
     parser.add_argument('--topk_list', type=list, default=[5,10,20], help='List of top-k values for evaluation metrics (argparse type=list is broken; do NOT pass this on the CLI)')
     parser.add_argument('--beam_size', type=int, default=30, help='Beam size for generation')
     parser.add_argument('--ref_size', type=int, default=32, help='Number of fixed validation samples for reference outputs')
@@ -286,90 +334,68 @@ if __name__ == "__main__":
 
     codes_sha256 = sha256_file(config['code_path'])
     logging.info(f"code_path sha256: {codes_sha256}")
+    user_mapping_sha256 = sha256_file(config['user_mapping_path'])
+    logging.info(f"user_mapping sha256: {user_mapping_sha256}")
+
+    save_dir = os.path.dirname(os.path.abspath(config['save_path']))
+    os.makedirs(save_dir, exist_ok=True)
+    # audit artifact: int userID -> user token binding (hash goes into ckpt)
+    user_bucket_map = build_user_bucket_map(config['user_mapping_path'])
+    user_map_out = os.path.join(save_dir, 'user_bucket_map.json')
+    save_user_bucket_map(user_bucket_map, user_map_out)
+    user_map_sha256 = sha256_file(user_map_out)
+    logging.info(f"user bucket map written to {user_map_out} sha256: {user_map_sha256}")
 
     train_dataset = GenRecDataset(
         dataset_path=config['dataset_path']+ '/train.parquet',
         code_path=config['code_path'],
         mode='train',
-        max_len=config['max_len']
+        max_len=config['max_len'],
+        user_mapping_path=config['user_mapping_path'],
     )
     validation_dataset = GenRecDataset(
         dataset_path=config['dataset_path'] + '/valid.parquet',
         code_path=config['code_path'],
         mode='evaluation',
-        max_len=config['max_len']
+        max_len=config['max_len'],
+        user_mapping_path=config['user_mapping_path'],
     )
     test_dataset = GenRecDataset(
         dataset_path=config['dataset_path'] + '/test.parquet',
         code_path=config['code_path'],
         mode='evaluation',
-        max_len=config['max_len']
+        max_len=config['max_len'],
+        user_mapping_path=config['user_mapping_path'],
     )
 
     train_dataloader = GenRecDataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True)
     validation_dataloader = GenRecDataLoader(validation_dataset, batch_size=config['infer_size'], shuffle=False)
-    test_dataloader = GenRecDataLoader(test_dataset, batch_size=config['infer_size'], shuffle=False)
 
-    # optimizer
-    optimizer = optim.Adam(model.parameters(), lr=config['lr'])
+    # optimizer (assumption params registered in the report: betas/eps/wd)
+    optimizer = optim.Adam(model.parameters(), lr=config['lr'],
+                           betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
 
     # Train the model
     model.to(device)
     if device.type == 'cuda':
         torch.cuda.reset_peak_memory_stats(device)
 
-    best_ndcg = 0.0
-    early_stop_counter = 0
-    history = []
     run_start = time()
+    loss_history, n_steps_done, train_wall = train_steps(
+        model, train_dataloader, optimizer, device,
+        config['max_steps'], config['log_every'], config['lr'], config['lr_constant_steps'])
+    logging.info(f"Training done: {n_steps_done} steps, wall_sec: {train_wall:.3f}")
+    for entry in loss_history:
+        logging.info(f"step {entry['step']} loss_since_last {entry['loss_since_last']:.4f} lr {entry['lr']:.6g}")
 
     # fixed reference batch: first ref_size validation samples in dataset order
     fixed_batch = validation_dataloader.collate_fn([validation_dataset[i] for i in range(config['ref_size'])])
 
-    save_dir = os.path.dirname(os.path.abspath(config['save_path']))
-    os.makedirs(save_dir, exist_ok=True)
-    last_smoke_path = os.path.splitext(config['save_path'])[0] + '_last_smoke.pth'
-
-    for epoch in range(config['num_epochs']):
-        logging.info(f"Epoch {epoch + 1}/{config['num_epochs']}")
-        train_loss, n_steps, train_wall = train(model, train_dataloader, optimizer, device)
-        logging.info(f"Training loss: {train_loss} steps: {n_steps} wall_sec: {train_wall:.3f}")
-        # Evaluate the model
-        avg_recalls, avg_ndcgs, sw_recalls, sw_ndcgs, eval_wall, n_valid = evaluate(
-            model, validation_dataloader, config['topk_list'], config['beam_size'], device)
-        logging.info(f"Validation Dataset (batch-mean): {avg_recalls} {avg_ndcgs} wall_sec: {eval_wall:.3f}")
-        logging.info(f"Validation Dataset (sample-weighted): {sw_recalls} {sw_ndcgs}")
-        history.append({
-            'epoch': epoch + 1,
-            'train_loss': train_loss, 'train_steps': n_steps, 'train_wall_sec': round(train_wall, 3),
-            'valid_batch_mean': {**avg_recalls, **avg_ndcgs},
-            'valid_sample_weighted': {**sw_recalls, **sw_ndcgs},
-            'valid_wall_sec': round(eval_wall, 3), 'valid_n_samples': n_valid,
-        })
-        # save last_smoke every epoch so a short/failed run is still reloadable
-        save_checkpoint(last_smoke_path, model, config, epoch + 1, codes_sha256)
-        save_reference_outputs(last_smoke_path.replace('.pth', '_ref.npz'), model, fixed_batch, config['beam_size'], device)
-        if avg_ndcgs['NDCG@20'] > best_ndcg:
-            best_ndcg = avg_ndcgs['NDCG@20']
-            early_stop_counter = 0  # Reset early stop counter
-            test_avg_recalls, test_avg_ndcgs, test_sw_recalls, test_sw_ndcgs, test_wall, n_test, test_pos = evaluate(
-                model, test_dataloader, config['topk_list'], config['beam_size'], device, return_per_sample=True)
-            logging.info(f"Best NDCG@20: {best_ndcg}")
-            logging.info(f"Test Dataset (batch-mean): {test_avg_recalls} {test_avg_ndcgs} wall_sec: {test_wall:.3f}")
-            logging.info(f"Test Dataset (sample-weighted): {test_sw_recalls} {test_sw_ndcgs}")
-            np.savez_compressed(os.path.join(save_dir, 'test_per_sample.npz'),
-                                pos_index=test_pos.numpy().astype(bool),
-                                epoch=epoch + 1)
-            # Save the best model (unified format, tied to this run's codes)
-            save_checkpoint(config['save_path'], model, config, epoch + 1, codes_sha256)
-            save_reference_outputs(config['save_path'].replace('.pth', '_ref.npz'), model, fixed_batch, config['beam_size'], device)
-            logging.info(f"Best model saved to {config['save_path']}")
-        else:
-            early_stop_counter += 1
-            logging.info(f"No improvement in NDCG@20. Early stop counter: {early_stop_counter}")
-            if early_stop_counter >= config['early_stop']:
-                logging.info("Early stopping triggered.")
-                break
+    # no metric-based selection: save the final model (paper trains a fixed
+    # budget; validation/evaluation are separate entry points)
+    save_checkpoint(config['save_path'], model, config, n_steps_done, codes_sha256, user_map_sha256)
+    save_reference_outputs(config['save_path'].replace('.pth', '_ref.npz'), model, fixed_batch, config['beam_size'], device)
+    logging.info(f"Final model saved to {config['save_path']}")
 
     total_wall = time() - run_start
     peak_mem = None
@@ -381,12 +407,14 @@ if __name__ == "__main__":
     summary = {
         'config': config,
         'codes_sha256': codes_sha256,
+        'user_map_sha256': user_map_sha256,
+        'user_mapping_sha256': user_mapping_sha256,
         'total_wall_sec': round(total_wall, 3),
+        'train_wall_sec': round(train_wall, 3),
+        'steps_done': n_steps_done,
         'peak_mem': peak_mem,
-        'best_ndcg20_batch_mean': best_ndcg,
         'save_path': config['save_path'],
-        'last_smoke_path': last_smoke_path,
-        'history': history,
+        'loss_history': loss_history,
     }
     summary_path = os.path.join(save_dir, 'rec_train_summary.json')
     with open(summary_path, 'w') as f:

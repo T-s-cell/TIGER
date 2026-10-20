@@ -1,22 +1,25 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from .layers import kmeans, sinkhorn_algorithm
+from .layers import kmeans
 
 
 class VectorQuantizer(nn.Module):
+    """Nearest-neighbor quantizer (paper §3.1; Sinkhorn reallocation removed).
+
+    forward returns the raw quantized vector q_d (gradient flows to the
+    codebook only via codebook_loss). There is no per-layer STE: the single
+    straight-through reparametrization is applied once at the decoder input in
+    RQVAE.forward.
+    """
 
     def __init__(self, n_e, e_dim,
-                 beta = 0.25, kmeans_init = False, kmeans_iters = 10,
-                 sk_epsilon=0.003, sk_iters=100,):
+                 beta = 0.25, kmeans_init = False, kmeans_iters = 10):
         super().__init__()
         self.n_e = n_e
         self.e_dim = e_dim
         self.beta = beta
         self.kmeans_init = kmeans_init
         self.kmeans_iters = kmeans_iters
-        self.sk_epsilon = sk_epsilon
-        self.sk_iters = sk_iters
 
         self.embedding = nn.Embedding(self.n_e, self.e_dim)
         if not kmeans_init:
@@ -48,20 +51,8 @@ class VectorQuantizer(nn.Module):
         self.embedding.weight.data.copy_(centers)
         self.initted = True
 
-    @staticmethod
-    def center_distance_for_constraint(distances):
-        # distances: B, K
-        max_distance = distances.max()
-        min_distance = distances.min()
-
-        middle = (max_distance + min_distance) / 2
-        amplitude = max_distance - middle + 1e-5
-        assert amplitude > 0
-        centered_distances = (distances - middle) / amplitude
-        return centered_distances
-
-    def forward(self, x, use_sk=True):
-        # Flatten input
+    def forward(self, x):
+        # x: residual r_d, shape [*, e_dim]
         latent = x.view(-1, self.e_dim)
 
         if not self.initted and self.training:
@@ -71,31 +62,15 @@ class VectorQuantizer(nn.Module):
         d = torch.sum(latent**2, dim=1, keepdim=True) + \
             torch.sum(self.embedding.weight**2, dim=1, keepdim=True).t()- \
             2 * torch.matmul(latent, self.embedding.weight.t())
-        if not use_sk or self.sk_epsilon <= 0:
-            indices = torch.argmin(d, dim=-1)
-        else:
-            d = self.center_distance_for_constraint(d)
-            d = d.double()
-            Q = sinkhorn_algorithm(d, self.sk_epsilon, self.sk_iters)
+        indices = torch.argmin(d, dim=-1)
 
-            if torch.isnan(Q).any() or torch.isinf(Q).any():
-                print(f"Sinkhorn Algorithm returns nan/inf values.")
-            indices = torch.argmax(Q, dim=-1)
+        q = self.embedding(indices).view(x.shape)
 
-        # indices = torch.argmin(d, dim=-1)
-
-        x_q = self.embedding(indices).view(x.shape)
-
-        # compute loss for embedding
-        commitment_loss = F.mse_loss(x_q.detach(), x)
-        codebook_loss = F.mse_loss(x_q, x.detach())
-        loss = codebook_loss + self.beta * commitment_loss
-
-        # preserve gradients
-        x_q = x + (x_q - x).detach()
+        # §3.1: codebook loss ||sg[r_d] - e||^2, commitment beta*||r_d - sg[e]||^2
+        # reduction: sum over the feature dim, mean over the batch
+        codebook_loss = (q - x.detach()).pow(2).sum(-1).mean()
+        commit_loss = self.beta * (x - q.detach()).pow(2).sum(-1).mean()
 
         indices = indices.view(x.shape[:-1])
 
-        return x_q, loss, indices
-
-
+        return q, codebook_loss, commit_loss, indices

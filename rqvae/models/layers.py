@@ -80,29 +80,3 @@ def kmeans(
     tensor_centers = torch.from_numpy(centers).to(device)
 
     return tensor_centers
-
-
-@torch.no_grad()
-def sinkhorn_algorithm(distances, epsilon, sinkhorn_iterations):
-    Q = torch.exp(- distances / epsilon)
-
-    B = Q.shape[0] # number of samples to assign
-    K = Q.shape[1] # how many centroids per block (usually set to 256)
-
-    # make the matrix sums to 1
-    sum_Q = Q.sum(-1, keepdim=True).sum(-2, keepdim=True)
-    Q /= sum_Q
-    # print(Q.sum())
-    for it in range(sinkhorn_iterations):
-
-        # normalize each column: total weight per sample must be 1/B
-        Q /= torch.sum(Q, dim=1, keepdim=True)
-        Q /= B
-
-        # normalize each row: total weight per prototype must be 1/K
-        Q /= torch.sum(Q, dim=0, keepdim=True)
-        Q /= K
-
-
-    Q *= B # the colomns must sum to 1 so that Q is an assignment
-    return Q

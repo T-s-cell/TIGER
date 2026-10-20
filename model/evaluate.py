@@ -3,11 +3,13 @@
 model/main.py's --mode argument was never wired to an independent evaluation
 branch at the base commit; this script is the real entry point. It rebuilds the
 model from the checkpoint's own config, verifies the checkpoint is bound to
-the same codes file (sha256), evaluates valid/test with both batch-mean and
-sample-weighted metrics, stores per-sample results, and (with --reload_check)
-compares against the save-time reference outputs in <ckpt>_ref.npz: the fixed
-inputs (history, attention mask, labels) must rebuild identically from the
-current data, predictions must match exactly and logits max|diff| <= 1e-6.
+the same codes file and user bucket map (sha256), evaluates valid/test with
+both batch-mean and sample-weighted metrics plus the illegal-ID rate (a
+generated 4-token ID that maps to no item keeps its rank and counts as a miss),
+stores per-sample results, and (with --reload_check) compares against the
+save-time reference outputs in <ckpt>_ref.npz: the fixed inputs (history,
+attention mask, labels) must rebuild identically from the current data,
+predictions must match exactly and logits max|diff| <= 1e-6.
 """
 import argparse
 import hashlib
@@ -36,7 +38,7 @@ def sha256_file(path, chunk_size=1 << 20):
     return h.hexdigest()
 
 
-def build_model_and_load(save_path, code_path, device):
+def build_model_and_load(save_path, code_path, user_map_path, device):
     ckpt = torch.load(save_path, map_location='cpu')
     config = ckpt['config']
     ckpt_codes_sha = ckpt.get('codes_sha256')
@@ -47,25 +49,36 @@ def build_model_and_load(save_path, code_path, device):
         raise SystemExit(
             f"FATAL: codes mismatch: checkpoint bound to {ckpt_codes_sha} "
             f"but --code_path is {actual_codes_sha}")
+    ckpt_user_sha = ckpt.get('user_map_sha256')
+    if ckpt_user_sha is None:
+        raise SystemExit("FATAL: checkpoint has no user_map_sha256 (wrong format for this pipeline)")
+    actual_user_sha = sha256_file(user_map_path)
+    if ckpt_user_sha != actual_user_sha:
+        raise SystemExit(
+            f"FATAL: user bucket map mismatch: checkpoint bound to {ckpt_user_sha} "
+            f"but --user_map_path is {actual_user_sha}")
     model = TIGER(config)
     model.load_state_dict(ckpt['state_dict'], strict=True)
     model.to(device)
     model.eval()
-    print(f"loaded {save_path} (epoch {ckpt.get('epoch')}, codes {ckpt_codes_sha[:12]}...)")
+    print(f"loaded {save_path} (step {ckpt.get('step')}, codes {ckpt_codes_sha[:12]}..., "
+          f"user_map {ckpt_user_sha[:12]}...)")
     return model, config, ckpt
 
 
-def full_eval(model, config, dataset_path, code_path, split, batch_size, beam_size, device, out_dir):
+def full_eval(model, config, dataset_path, code_path, user_map_path, split, batch_size, beam_size, device, out_dir):
     dataset = GenRecDataset(
         dataset_path=os.path.join(dataset_path, f'{split}.parquet'),
         code_path=code_path,
         mode='evaluation',
         max_len=config['max_len'],
+        user_mapping_path=user_map_path,
     )
     loader = GenRecDataLoader(dataset, batch_size=batch_size, shuffle=False)
-    avg_recalls, avg_ndcgs, sw_recalls, sw_ndcgs, wall, n, pos_index = evaluate(
-        model, loader, config['topk_list'], beam_size, device, return_per_sample=True)
-    print(f"[{split}] n={n} wall={wall:.1f}s")
+    (avg_recalls, avg_ndcgs, sw_recalls, sw_ndcgs, wall, n, pos_index,
+     illegal_stats) = evaluate(model, loader, config['topk_list'], beam_size, device,
+                               return_per_sample=True, code_to_item=dataset.code_to_item)
+    print(f"[{split}] n={n} wall={wall:.1f}s illegal={illegal_stats}")
     print(f"[{split}] batch-mean:      {json.dumps({**avg_recalls, **avg_ndcgs})}")
     print(f"[{split}] sample-weighted: {json.dumps({**sw_recalls, **sw_ndcgs})}")
     os.makedirs(out_dir, exist_ok=True)
@@ -77,22 +90,24 @@ def full_eval(model, config, dataset_path, code_path, split, batch_size, beam_si
         'split': split, 'n_samples': n, 'wall_sec': round(wall, 3),
         'batch_mean': {**avg_recalls, **avg_ndcgs},
         'sample_weighted': {**sw_recalls, **sw_ndcgs},
+        'illegal_ids': illegal_stats,
     }
     return result
 
 
-def reload_check(model, config, save_path, code_path, dataset_path, device, ref_size, beam_size, tol=1e-6):
+def reload_check(model, config, save_path, code_path, user_map_path, dataset_path, device, ref_size, beam_size, tol=1e-6):
     ref_path = save_path.replace('.pth', '_ref.npz')
     if not os.path.exists(ref_path):
         raise SystemExit(f"FATAL: reference file not found: {ref_path}")
     ref = np.load(ref_path)
     # cross-check that the fixed inputs still rebuild identically from the
-    # current dataset + codes (guards against wrong data being attached)
+    # current dataset + codes + user map (guards against wrong data being attached)
     dataset = GenRecDataset(
         dataset_path=os.path.join(dataset_path, 'valid.parquet'),
         code_path=code_path,
         mode='evaluation',
         max_len=config['max_len'],
+        user_mapping_path=user_map_path,
     )
     loader = GenRecDataLoader(dataset, batch_size=ref_size, shuffle=False)
     rebuilt = loader.collate_fn([dataset[i] for i in range(ref_size)])
@@ -135,6 +150,7 @@ def main():
     parser = argparse.ArgumentParser(description="Independent evaluation / reload check for TIGER")
     parser.add_argument('--save_path', type=str, required=True, help='checkpoint (.pth) from this run')
     parser.add_argument('--code_path', type=str, required=True, help='codes .npy from this run')
+    parser.add_argument('--user_map_path', type=str, required=True, help='user_bucket_map.json saved by training')
     parser.add_argument('--dataset_path', type=str, required=True, help='dir with train/valid/test.parquet')
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--infer_size', type=int, default=96)
@@ -152,22 +168,23 @@ def main():
     device = requested
 
     os.makedirs(args.out_dir, exist_ok=True)
-    model, config, ckpt = build_model_and_load(args.save_path, args.code_path, device)
+    model, config, ckpt = build_model_and_load(args.save_path, args.code_path, args.user_map_path, device)
     config['topk_list'] = [5, 10, 20]  # never via CLI (argparse type=list is broken upstream)
 
-    results = {'save_path': args.save_path, 'epoch': ckpt.get('epoch'),
+    results = {'save_path': args.save_path, 'step': ckpt.get('step'),
                'device': str(device), 'cuda_available': torch.cuda.is_available()}
     if args.reload_check:
         results['reload_check'] = reload_check(
-            model, config, args.save_path, args.code_path, args.dataset_path,
-            device, args.ref_size, args.beam_size)
+            model, config, args.save_path, args.code_path, args.user_map_path,
+            args.dataset_path, device, args.ref_size, args.beam_size)
         if not results['reload_check']['pass']:
             raise SystemExit(1)
     else:
         splits = ['valid', 'test'] if args.split == 'both' else [args.split]
         for split in splits:
             results[split] = full_eval(model, config, args.dataset_path, args.code_path,
-                                       split, args.infer_size, args.beam_size, device, args.out_dir)
+                                       args.user_map_path, split, args.infer_size,
+                                       args.beam_size, device, args.out_dir)
 
     with open(os.path.join(args.out_dir, 'eval_report.json'), 'w') as f:
         json.dump(results, f, indent=2)

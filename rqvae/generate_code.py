@@ -1,14 +1,11 @@
 """Generate 4-digit semantic IDs with a trained RQ-VAE checkpoint.
 
-Derived from rqvae/generate_code.py at base commit f1e30af. The generation and
-collision-resolution pipeline (nearest-neighbor assignment, Sinkhorn
-reallocation loop, 4th-digit disambiguation) is unchanged. Changes are
-engineering-only: paths/device are argparse arguments instead of hard-coded
-constants, and --data_path explicitly overrides the path stored inside the
-checkpoint (which may point to another dataset or an old preprocessing run).
+Paper-aligned pipeline (§4.1): pure nearest-neighbor assignment (no Sinkhorn
+reallocation), then a 4th disambiguation digit — unique triplets get 0,
+collision groups are numbered 0..n-1 in ItemID ascending order. A collision
+group larger than the codebook size (256) is a hard error.
 """
 import argparse
-import collections
 import os
 import sys
 
@@ -20,35 +17,6 @@ from torch.utils.data import DataLoader
 
 from datasets import EmbDataset
 from models.rqvae import RQVAE
-
-
-def check_collision(all_indices_str):
-    tot_item = len(all_indices_str)
-    tot_indice = len(set(all_indices_str.tolist()))
-    return tot_item == tot_indice
-
-
-def get_indices_count(all_indices_str):
-    indices_count = collections.defaultdict(int)
-    for index in all_indices_str:
-        indices_count[index] += 1
-    return indices_count
-
-
-def get_collision_item(all_indices_str):
-    index2id = {}
-    for i, index in enumerate(all_indices_str):
-        if index not in index2id:
-            index2id[index] = []
-        index2id[index].append(i)
-
-    collision_item_groups = []
-
-    for index in index2id:
-        if len(index2id[index]) > 1:
-            collision_item_groups.append(index2id[index])
-
-    return collision_item_groups
 
 
 def parse_args():
@@ -86,8 +54,6 @@ if __name__ == "__main__":
                   quant_loss_weight=ckpt_args.quant_loss_weight,
                   kmeans_init=ckpt_args.kmeans_init,
                   kmeans_iters=ckpt_args.kmeans_iters,
-                  sk_epsilons=ckpt_args.sk_epsilons,
-                  sk_iters=ckpt_args.sk_iters,
                   )
 
     model.load_state_dict(state_dict)
@@ -105,7 +71,7 @@ if __name__ == "__main__":
 
     for d in tqdm(data_loader):
         d = d.to(device)
-        indices = model.get_indices(d, use_sk=False)
+        indices = model.get_indices(d)
         indices = indices.view(-1, indices.shape[-1]).cpu().numpy()
         for index in indices:
             code = []
@@ -118,38 +84,11 @@ if __name__ == "__main__":
     all_indices = np.array(all_indices)
     all_indices_str = np.array(all_indices_str)
 
-    for vq in model.rq.vq_layers[:-1]:
-        vq.sk_epsilon = 0.0
-
-    tt = 0
-    # There are often duplicate items in the dataset, and we no longer differentiate them
-    while True:
-        if tt >= 30 or check_collision(all_indices_str):
-            break
-
-        collision_item_groups = get_collision_item(all_indices_str)
-        print(collision_item_groups)
-        print(len(collision_item_groups))
-        for collision_items in collision_item_groups:
-            d = data[collision_items].to(device)
-
-            indices = model.get_indices(d, use_sk=True)
-            indices = indices.view(-1, indices.shape[-1]).cpu().numpy()
-            for item, index in zip(collision_items, indices):
-                code = []
-                for i, ind in enumerate(index):
-                    code.append(prefix[i].format(int(ind)))
-
-                all_indices[item] = code
-                all_indices_str[item] = str(code)
-        tt += 1
-
     print("All indices number: ", len(all_indices))
-    print("Max number of conflicts: ", max(get_indices_count(all_indices_str).values()))
 
     tot_item = len(all_indices_str)
     tot_indice = len(set(all_indices_str.tolist()))
-    print("Collision Rate", (tot_item - tot_indice) / tot_item)
+    print("Collision Rate (before 4th digit)", (tot_item - tot_indice) / tot_item)
 
     all_indices_dict = {}
     for item, indices in enumerate(all_indices.tolist()):
@@ -167,6 +106,11 @@ if __name__ == "__main__":
 
     # Resolve duplicates by incrementing the last dimension
     unique_codes, counts = np.unique(codes_array, axis=0, return_counts=True)
+    max_group = int(counts.max())
+    if max_group > 256:
+        print(f"FATAL: largest collision group has {max_group} items > codebook size 256; "
+              "the 4th digit cannot disambiguate. Not truncating IDs or enlarging the vocab.")
+        sys.exit(1)
     duplicates = unique_codes[counts > 1]
 
     if len(duplicates) > 0:
@@ -205,5 +149,10 @@ if __name__ == "__main__":
     os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
     print(f"Saving codes to {output_file}")
     print(f"the first 5 codes: {codes_array[:5]}")
+    n_items = codes_array.shape[0]
+    for li in range(codes_array.shape[1]):
+        n_unique = len(set(codes_array[:, li].tolist()))
+        print(f"layer {li} usage: {n_unique}/{codes_array[:, li].max() + 1} distinct "
+              f"(vs codebook 256: {n_unique}/256 = {n_unique / 256:.4f})")
     np.save(output_file, codes_array)
-    print(f"codes shape: {codes_array.shape}, all digits in [0,255], unique: OK")
+    print(f"codes shape: {codes_array.shape} ({n_items} items), all digits in [0,255], unique: OK")

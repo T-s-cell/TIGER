@@ -1,10 +1,11 @@
-"""Text encoding for TIGER original_smoke_beauty.
+"""Text encoding for TIGER paper-aligned Beauty (paper §4.1: features are
+title/price/brand/categories — salesRank is dropped).
 
-Replicates data/process.ipynb cell 6-7 exactly: metadata field extraction
-(title/price/salesRank/brand/categories with the original falsy->None rule),
-the exact f-string text template (missing keys become '', None values become
-the literal string 'None'), and SentenceTransformer.encode with default
-settings (no normalization, model's own truncation).
+Kept from the frozen smoke version: the falsy->None rule, the f-string text
+template style (missing keys become '', None values become the literal string
+'None'), and SentenceTransformer.encode with default settings (no
+normalization, model's own truncation). The exact concatenation template is an
+implementation assumption (the paper does not publish it).
 
 Differences from the notebook (recorded for the audit):
 - raw metadata lines are parsed with ast.literal_eval instead of eval();
@@ -50,11 +51,12 @@ def sha256_file(path, chunk_size=1 << 20):
 
 
 def build_text(info):
-    # exact template from process.ipynb (note the literal spaces after \n and
-    # the single quotes around keys); info.get(key, '') keeps notebook behavior
+    # paper §4.1 feature set: title/price/brand/categories (salesRank dropped).
+    # Template style kept from the frozen script (literal spaces after \n and
+    # single quotes around keys); info.get(key, '') keeps the original behavior
     return (
         f"'title':{info.get('title', '')}\n 'price':{info.get('price', '')}\n"
-        f" 'salesRank':{info.get('salesRank', '')}\n 'brand':{info.get('brand', '')}\n"
+        f" 'brand':{info.get('brand', '')}\n"
         f" 'categories':{info.get('categories', '')}"
     )
 
@@ -94,7 +96,6 @@ def main():
             item_info[itemID] = {
                 "title": metadata.get("title") if metadata.get("title") else None,
                 "price": metadata.get("price") if metadata.get("price") else None,
-                "salesRank": metadata.get("salesRank") if metadata.get("salesRank") else None,
                 "brand": metadata.get("brand") if metadata.get("brand") else None,
                 "categories": metadata.get("categories") if metadata.get("categories") else None,
             }
