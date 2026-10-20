@@ -1,4 +1,7 @@
+import hashlib
+import json
 import logging
+import os
 
 import numpy as np
 import torch
@@ -8,7 +11,6 @@ from tqdm import tqdm
 from transformers import get_linear_schedule_with_warmup, get_constant_schedule_with_warmup
 
 from utils import ensure_dir,set_color,get_local_time,delete_file
-import os
 
 import heapq
 class Trainer(object):
@@ -45,6 +47,43 @@ class Trainer(object):
         self.optimizer = self._build_optimizer()
         self.scheduler = self._get_scheduler()
         self.model = self.model.to(self.device)
+
+        # ---- bookkeeping added for the smoke run (no change to training math) ----
+        self.total_optimizer_steps = 0
+        self.records = {"epochs": [], "param_checks": [], "first_batch_wall": None,
+                        "kmeans_init": None, "peak_mem_allocated": None,
+                        "peak_mem_reserved": None, "steps_per_epoch": data_num}
+        # spot-check param updates on a few epoch starts after warmup (lr>0),
+        # not every step, so timing is not distorted
+        warmup = args.warmup_epochs
+        candidates = [warmup + 10, max(warmup + 10, self.epochs - 20), self.epochs - 1]
+        self.param_check_epochs = sorted({c for c in candidates if warmup < c < self.epochs})
+
+    def _sync(self):
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+
+    def _peak_mem(self):
+        if self.device.type == "cuda":
+            alloc = torch.cuda.max_memory_allocated(self.device)
+            resv = torch.cuda.max_memory_reserved(self.device)
+            self.records["peak_mem_allocated"] = max(self.records["peak_mem_allocated"] or 0, alloc)
+            self.records["peak_mem_reserved"] = max(self.records["peak_mem_reserved"] or 0, resv)
+
+    def _component_hashes(self):
+        m = self.model
+        blobs = {"encoder": m.encoder.state_dict(),
+                 "decoder": m.decoder.state_dict()}
+        out = {}
+        for name, sd in blobs.items():
+            h = hashlib.sha256()
+            for k in sorted(sd):
+                h.update(k.encode()); h.update(sd[k].detach().cpu().numpy().tobytes())
+            out[name] = h.hexdigest()
+        for li, vq in enumerate(m.rq.vq_layers):
+            out[f"codebook_l{li}"] = hashlib.sha256(
+                vq.embedding.weight.detach().cpu().numpy().tobytes()).hexdigest()
+        return out
 
     def _build_optimizer(self):
 
@@ -108,7 +147,18 @@ class Trainer(object):
                     desc=set_color(f"Train {epoch_idx}","pink"),
                     )
 
+        do_param_check = epoch_idx in self.param_check_epochs
+        pre_hashes = self._component_hashes() if do_param_check else None
+        check_done = False
+
+        self._sync()
+        epoch_start = time()
+        lr_this_epoch = None
         for batch_idx, data in enumerate(iter_data):
+            if batch_idx == 0 and self.records["first_batch_wall"] is None:
+                self._sync()
+                t_fwd0 = time()
+                init_flags_before = [vq.initted for vq in self.model.rq.vq_layers]
             data = data.to(self.device)
             self.optimizer.zero_grad()
             out, rq_loss, indices = self.model(data)
@@ -118,9 +168,46 @@ class Trainer(object):
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
             self.scheduler.step()
+            self.total_optimizer_steps += 1
+            lr_this_epoch = self.scheduler.get_last_lr()[0]
+            if batch_idx == 0 and self.records["first_batch_wall"] is None:
+                self._sync()
+                self.records["first_batch_wall"] = time() - t_fwd0
+                init_flags_after = [vq.initted for vq in self.model.rq.vq_layers]
+                if not all(init_flags_before) and all(init_flags_after):
+                    self.records["kmeans_init"] = {
+                        "first_batch_includes_kmeans_init": True,
+                        "wall_sec": round(self.records["first_batch_wall"], 3),
+                        "note": "first-batch forward+backward+step wall time; sklearn kmeans runs inside init_emb on CPU",
+                    }
+            # spot-check: did each component actually update on a real (lr>0) step?
+            if do_param_check and not check_done and lr_this_epoch and lr_this_epoch > 0:
+                post_hashes = self._component_hashes()
+                self.records["param_checks"].append({
+                    "epoch": epoch_idx, "batch": batch_idx,
+                    "lr": lr_this_epoch,
+                    "changed": {k: post_hashes[k] != pre_hashes[k] for k in post_hashes},
+                })
+                check_done = True
             # print(self.scheduler.get_last_lr())
             total_loss += loss.item()
             total_recon_loss += loss_recon.item()
+
+        self._sync()
+        epoch_time = time() - epoch_start
+        self._peak_mem()
+        self.records["epochs"].append({
+            "epoch": epoch_idx,
+            "wall_sec": round(epoch_time, 3),
+            "steps": len(iter_data) if hasattr(iter_data, "__len__") else batch_idx + 1,
+            "lr_last": lr_this_epoch,
+            "loss": total_loss,
+            "recon_loss": total_recon_loss,
+        })
+        self.logger.info(
+            f"epoch {epoch_idx} wall {epoch_time:.3f}s steps {self.total_optimizer_steps} "
+            f"lr {lr_this_epoch:.6g} loss {total_loss:.4f}"
+        )
 
         return total_loss, total_recon_loss
 
@@ -228,6 +315,11 @@ class Trainer(object):
                 ) % (epoch_idx, valid_end_time - valid_start_time, collision_rate)
 
                 self.logger.info(valid_score_output)
+                self.records.setdefault("validations", []).append({
+                    "epoch": epoch_idx,
+                    "collision_rate": collision_rate,
+                    "wall_sec": round(valid_end_time - valid_start_time, 3),
+                })
                 ckpt_path = self._save_checkpoint(epoch_idx, collision_rate=collision_rate)
                 now_save = (-collision_rate, ckpt_path)
                 if len(self.newest_save_queue) < self.save_limit:
@@ -247,9 +339,12 @@ class Trainer(object):
                         delete_file(old_save[1])
 
 
+        self.records["total_optimizer_steps"] = self.total_optimizer_steps
+        self.records["best_loss"] = float(self.best_loss) if np.isfinite(self.best_loss) else None
+        self.records["best_collision_rate"] = float(self.best_collision_rate) if np.isfinite(self.best_collision_rate) else None
+        stats_path = os.path.join(self.ckpt_dir, "train_stats.json")
+        with open(stats_path, "w") as f:
+            json.dump(self.records, f, indent=2)
+        print(f"train stats written to {stats_path}")
 
         return self.best_loss, self.best_collision_rate
-
-
-
-

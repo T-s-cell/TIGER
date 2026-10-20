@@ -42,13 +42,16 @@ def parse_args():
     parser.add_argument('--save_limit', type=int, default=5, help='save limit for ckpt')
     
     parser.add_argument("--ckpt_dir", type=str, default="./ckpt/Beauty", help="please specify output directory for model")
+    parser.add_argument('--seed', type=int, default=2024, help='random seed (set before model creation)')
 
     return parser.parse_args()
 
 
 if __name__ == '__main__':
+    args = parse_args()
+
     """fix the random seed"""
-    seed = 2024
+    seed = args.seed
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -56,7 +59,6 @@ if __name__ == '__main__':
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    args = parse_args()
     print("=================================================")
     print(args)
     print("=================================================")
