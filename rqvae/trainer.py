@@ -49,6 +49,12 @@ class Trainer(object):
         self.scheduler = self._get_scheduler()
         self.model = self.model.to(self.device)
 
+        # ---- bookkeeping added for the smoke run (no change to training math) ----
+        self.total_optimizer_steps = 0
+        self.records = {"epochs": [], "param_checks": [], "first_batch_wall": None,
+                        "kmeans_init": None, "peak_mem_allocated": None,
+                        "peak_mem_reserved": None, "steps_per_epoch": data_num}
+
         # ---- record-only diagnostics (--diagnose): training math unchanged ----
         self.diagnose = getattr(args, "diagnose", False)
         if self.diagnose:
@@ -58,12 +64,6 @@ class Trainer(object):
                         "measured on the training batches themselves",
             }
             self.records["data_stats"] = getattr(args, "data_stats", None)
-
-        # ---- bookkeeping added for the smoke run (no change to training math) ----
-        self.total_optimizer_steps = 0
-        self.records = {"epochs": [], "param_checks": [], "first_batch_wall": None,
-                        "kmeans_init": None, "peak_mem_allocated": None,
-                        "peak_mem_reserved": None, "steps_per_epoch": data_num}
         # spot-check param updates on a few epoch starts after warmup (lr>0),
         # not every step, so timing is not distorted
         warmup = args.warmup_epochs
