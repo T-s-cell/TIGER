@@ -50,6 +50,7 @@ ${PY} data/encode_text.py \
   --out_file "${RUN_DIR}/01_encode/item_emb.parquet" \
   --device cuda:0 \
   --batch_size 256 \
+  --revision "${ST_MODEL_REVISION:-unknown}" \
   2>&1 | tee "${LOGS}/02_encode.log"
 
 echo "[stage 3/7] RQ-VAE training (100 epochs, seed 2024, all other defaults)" | tee -a "${LOGS}/run_main.log"
@@ -83,7 +84,7 @@ ${PY} model/main.py \
 
 echo "[stage 6/7] checkpoint selection + full test evaluation" | tee -a "${LOGS}/run_main.log"
 BEST_NDCG="$(${PY} -c "import json;print(json.load(open('${RUN_DIR}/04_rec/rec_train_summary.json'))['best_ndcg20_batch_mean'])")"
-if python -c "import sys; sys.exit(0 if float('${BEST_NDCG}') > 0 else 1)"; then
+if "${PY}" -c "import sys; sys.exit(0 if float('${BEST_NDCG}') > 0 else 1)"; then
   SELECTED="${RUN_DIR}/04_rec/tiger_best.pth"
   echo "selected best checkpoint (valid NDCG@20 batch-mean = ${BEST_NDCG})" | tee -a "${LOGS}/run_main.log"
 else
@@ -108,7 +109,7 @@ ${PY} model/evaluate.py \
   --dataset_path "${RUN_DIR}/data" \
   --device cuda:0 \
   --reload_check \
-  --out_dir "${RUN_DIR}/05_reload" \
+  --out_dir "${RUN_DIR}/05_reload/reload" \
   2>&1 | tee "${LOGS}/07_reload_check.log"
 
 sha256sum "${RUN_DIR}/data/"*.parquet \
