@@ -44,6 +44,9 @@ def parse_args():
     parser.add_argument('--diagnose', action='store_true',
                         help='record-only diagnostics: per-epoch codebook usage, triplet '
                              'groups, latent variance, pre-clip grad norms (no math change)')
+    parser.add_argument('--diagnose_every', type=int, default=1,
+                        help='cadence (epochs) for batch-order hashing and fixed-weight '
+                             'full-data stats; last epoch always measured (record-only)')
 
     return parser.parse_args()
 

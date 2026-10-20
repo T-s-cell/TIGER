@@ -57,6 +57,7 @@ class Trainer(object):
 
         # ---- record-only diagnostics (--diagnose): training math unchanged ----
         self.diagnose = getattr(args, "diagnose", False)
+        self.diagnose_every = max(1, int(getattr(args, "diagnose_every", 1)))
         if self.diagnose:
             self.records["diagnostics"] = {
                 "per_epoch": [], "first_steps": [],
@@ -70,7 +71,10 @@ class Trainer(object):
                         "chain of training-batch byte hashes (batch-order "
                         "evidence). Fixed-stats batching iterates a stacked CPU "
                         "tensor directly (no DataLoader/RNG), so it cannot "
-                        "perturb the training shuffle.",
+                        "perturb the training shuffle. batch_order and "
+                        "fixed_per_epoch are sampled every --diagnose_every "
+                        "epochs (last epoch always); per_epoch/first_steps stay "
+                        "per-epoch.",
             }
             self.records["data_stats"] = getattr(args, "data_stats", None)
             self.records["checkpoint_hashes"] = {}
@@ -211,13 +215,15 @@ class Trainer(object):
 
         epoch_indices = [] if self.diagnose else None
         epoch_grad_norms = [] if self.diagnose else None
-        epoch_batch_hashes = [] if self.diagnose else None
+        do_batch_diag = self.diagnose and (epoch_idx % self.diagnose_every == 0
+                                           or epoch_idx == self.epochs - 1)
+        epoch_batch_hashes = [] if do_batch_diag else None
 
         self._sync()
         epoch_start = time()
         lr_this_epoch = None
         for batch_idx, data in enumerate(iter_data):
-            if self.diagnose:
+            if do_batch_diag:
                 epoch_batch_hashes.append(
                     hashlib.sha256(data.numpy().tobytes()).hexdigest())
             if batch_idx == 0 and self.records["first_batch_wall"] is None:
@@ -287,7 +293,7 @@ class Trainer(object):
         self._sync()
         epoch_time = time() - epoch_start
         self._peak_mem()
-        if self.diagnose:
+        if do_batch_diag:
             self.records["diagnostics"]["batch_order"].append({
                 "epoch": epoch_idx,
                 "n_batches": len(epoch_batch_hashes),
@@ -417,7 +423,8 @@ class Trainer(object):
             training_start_time = time()
             train_loss, train_recon_loss = self._train_epoch(data, epoch_idx)
             training_end_time = time()
-            if self.diagnose:
+            if self.diagnose and (epoch_idx % self.diagnose_every == 0
+                                  or epoch_idx == self.epochs - 1):
                 self.records["diagnostics"]["fixed_per_epoch"].append(
                     self._fixed_model_stats(xs_all, data.batch_size, epoch_idx))
             train_loss_output = self._generate_train_loss_output(
