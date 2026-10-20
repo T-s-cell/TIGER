@@ -60,15 +60,54 @@ class Trainer(object):
         if self.diagnose:
             self.records["diagnostics"] = {
                 "per_epoch": [], "first_steps": [],
-                "note": "record-only instrumentation; usage/latent/grad-norm "
-                        "measured on the training batches themselves",
+                "fixed_per_epoch": [], "batch_order": [],
+                "note": "record-only instrumentation. per_epoch/first_steps: "
+                        "measured on the training batches themselves (model "
+                        "updating during the epoch, batch-scoped). "
+                        "fixed_per_epoch: model.eval()+no_grad full-data pass "
+                        "with frozen weights after each epoch ends, over ALL "
+                        "items in dataset order. batch_order: per-epoch sha256 "
+                        "chain of training-batch byte hashes (batch-order "
+                        "evidence). Fixed-stats batching iterates a stacked CPU "
+                        "tensor directly (no DataLoader/RNG), so it cannot "
+                        "perturb the training shuffle.",
             }
             self.records["data_stats"] = getattr(args, "data_stats", None)
+            self.records["checkpoint_hashes"] = {}
         # spot-check param updates on a few epoch starts after warmup (lr>0),
         # not every step, so timing is not distorted
         warmup = args.warmup_epochs
         candidates = [warmup + 10, max(warmup + 10, self.epochs - 20), self.epochs - 1]
         self.param_check_epochs = sorted({c for c in candidates if warmup < c < self.epochs})
+
+    @torch.no_grad()
+    def _fixed_model_stats(self, xs_all, batch_size, epoch_idx):
+        """Full-data pass with frozen weights (eval + no_grad), dataset order.
+
+        Iterates a stacked CPU tensor directly -- no DataLoader, so no RNG
+        consumption and no perturbation of the training shuffle.
+        """
+        was_training = self.model.training
+        self.model.eval()
+        all_idx = []
+        for s in range(0, xs_all.shape[0], batch_size):
+            xb = xs_all[s:s + batch_size].to(self.device)
+            idx = self.model.get_indices(xb)
+            all_idx.append(idx.cpu().numpy())
+        arr = np.concatenate(all_idx, axis=0)
+        groups = collections.Counter(map(tuple, arr.tolist()))
+        row = {
+            "epoch": epoch_idx,
+            "n_items": int(arr.shape[0]),
+            "layer_unique": [int(len(set(arr[:, l].tolist()))) for l in range(arr.shape[1])],
+            "triplet_unique": len(groups),
+            "max_group": int(max(groups.values())),
+            "top1_share": float(max(groups.values()) / arr.shape[0]),
+            "weights_component_hashes": self._component_hashes(),
+        }
+        if was_training:
+            self.model.train()
+        return row
 
     def _sync(self):
         if self.device.type == "cuda":
@@ -172,11 +211,15 @@ class Trainer(object):
 
         epoch_indices = [] if self.diagnose else None
         epoch_grad_norms = [] if self.diagnose else None
+        epoch_batch_hashes = [] if self.diagnose else None
 
         self._sync()
         epoch_start = time()
         lr_this_epoch = None
         for batch_idx, data in enumerate(iter_data):
+            if self.diagnose:
+                epoch_batch_hashes.append(
+                    hashlib.sha256(data.numpy().tobytes()).hexdigest())
             if batch_idx == 0 and self.records["first_batch_wall"] is None:
                 self._sync()
                 t_fwd0 = time()
@@ -245,6 +288,12 @@ class Trainer(object):
         epoch_time = time() - epoch_start
         self._peak_mem()
         if self.diagnose:
+            self.records["diagnostics"]["batch_order"].append({
+                "epoch": epoch_idx,
+                "n_batches": len(epoch_batch_hashes),
+                "hash": hashlib.sha256(
+                    "".join(epoch_batch_hashes).encode()).hexdigest(),
+            })
             arr = np.concatenate(epoch_indices, axis=0)
             groups = collections.Counter(map(tuple, arr.tolist()))
             diag = {
@@ -330,6 +379,9 @@ class Trainer(object):
             "optimizer": self.optimizer.state_dict(),
         }
         torch.save(state, ckpt_path, pickle_protocol=4)
+        if self.diagnose:
+            self.records["checkpoint_hashes"][os.path.basename(ckpt_path)] = \
+                hashlib.sha256(open(ckpt_path, "rb").read()).hexdigest()
 
         self.logger.info(
             set_color("Saving current", "blue") + f": {ckpt_path}"
@@ -354,11 +406,20 @@ class Trainer(object):
 
         cur_eval_step = 0
 
+        xs_all = None
+        if self.diagnose:
+            self.records["diagnostics"]["init_component_hashes"] = \
+                self._component_hashes()
+            xs_all = torch.stack([data.dataset[i] for i in range(len(data.dataset))])
+
         for epoch_idx in range(self.epochs):
             # train
             training_start_time = time()
             train_loss, train_recon_loss = self._train_epoch(data, epoch_idx)
             training_end_time = time()
+            if self.diagnose:
+                self.records["diagnostics"]["fixed_per_epoch"].append(
+                    self._fixed_model_stats(xs_all, data.batch_size, epoch_idx))
             train_loss_output = self._generate_train_loss_output(
                 epoch_idx, training_start_time, training_end_time, train_loss, train_recon_loss
             )
