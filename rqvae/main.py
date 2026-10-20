@@ -41,6 +41,9 @@ def parse_args():
     
     parser.add_argument("--ckpt_dir", type=str, default="./ckpt/Beauty", help="please specify output directory for model")
     parser.add_argument('--seed', type=int, default=2024, help='random seed (set before model creation)')
+    parser.add_argument('--diagnose', action='store_true',
+                        help='record-only diagnostics: per-epoch codebook usage, triplet '
+                             'groups, latent variance, pre-clip grad norms (no math change)')
 
     return parser.parse_args()
 
@@ -65,6 +68,15 @@ if __name__ == '__main__':
 
     """build dataset"""
     data = EmbDataset(args.data_path)
+    if args.diagnose:
+        all_x = torch.stack([data[i] for i in range(len(data))])
+        args.data_stats = {
+            "n": int(len(data)), "dim": int(all_x.shape[1]),
+            "per_dim_std_mean": float(all_x.std(dim=0).mean()),
+            "norm_mean": float(all_x.norm(dim=1).mean()),
+            "norm_std": float(all_x.norm(dim=1).std()),
+        }
+        print("data_stats:", args.data_stats)
     model = RQVAE(in_dim=data.dim,
                   num_emb_list=args.num_emb_list,
                   e_dim=args.e_dim,

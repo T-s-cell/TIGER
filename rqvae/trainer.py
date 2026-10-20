@@ -1,3 +1,4 @@
+import collections
 import hashlib
 import json
 import logging
@@ -47,6 +48,16 @@ class Trainer(object):
         self.optimizer = self._build_optimizer()
         self.scheduler = self._get_scheduler()
         self.model = self.model.to(self.device)
+
+        # ---- record-only diagnostics (--diagnose): training math unchanged ----
+        self.diagnose = getattr(args, "diagnose", False)
+        if self.diagnose:
+            self.records["diagnostics"] = {
+                "per_epoch": [], "first_steps": [],
+                "note": "record-only instrumentation; usage/latent/grad-norm "
+                        "measured on the training batches themselves",
+            }
+            self.records["data_stats"] = getattr(args, "data_stats", None)
 
         # ---- bookkeeping added for the smoke run (no change to training math) ----
         self.total_optimizer_steps = 0
@@ -159,6 +170,9 @@ class Trainer(object):
         pre_hashes = self._component_hashes() if do_param_check else None
         check_done = False
 
+        epoch_indices = [] if self.diagnose else None
+        epoch_grad_norms = [] if self.diagnose else None
+
         self._sync()
         epoch_start = time()
         lr_this_epoch = None
@@ -168,6 +182,14 @@ class Trainer(object):
                 t_fwd0 = time()
                 init_flags_before = [vq.initted for vq in self.model.rq.vq_layers]
             data = data.to(self.device)
+            if self.diagnose and batch_idx == 0:
+                with torch.no_grad():
+                    z0 = self.model.encoder(data)
+                epoch_latent_stats = {
+                    "latent_per_dim_std_mean": float(z0.std(dim=0).mean()),
+                    "latent_norm_mean": float(z0.norm(dim=1).mean()),
+                    "latent_norm_std": float(z0.norm(dim=1).std()),
+                }
             self.optimizer.zero_grad()
             out, rq_loss, indices, layer_losses = self.model(data)
             loss, loss_recon = self.model.compute_loss(out, rq_loss, xs=data)
@@ -178,6 +200,17 @@ class Trainer(object):
                 raise ValueError("Gradient norm is not finite (nan/inf)")
             self.optimizer.step()
             self.total_optimizer_steps += 1
+            if self.diagnose:
+                epoch_indices.append(indices.detach().cpu().numpy())
+                gn = float(total_grad_norm)
+                epoch_grad_norms.append(gn)
+                if self.total_optimizer_steps <= 5:
+                    self.records["diagnostics"]["first_steps"].append({
+                        "global_step": self.total_optimizer_steps,
+                        "epoch": epoch_idx, "batch": batch_idx,
+                        "loss": float(loss), "recon": float(loss_recon),
+                        "grad_norm_pre_clip": gn,
+                    })
             if self.scheduler is not None:
                 self.scheduler.step()
                 lr_this_epoch = self.scheduler.get_last_lr()[0]
@@ -211,6 +244,28 @@ class Trainer(object):
         self._sync()
         epoch_time = time() - epoch_start
         self._peak_mem()
+        if self.diagnose:
+            arr = np.concatenate(epoch_indices, axis=0)
+            groups = collections.Counter(map(tuple, arr.tolist()))
+            diag = {
+                "epoch": epoch_idx,
+                "n_assigned": int(arr.shape[0]),
+                "layer_unique": [int(len(set(arr[:, l].tolist()))) for l in range(arr.shape[1])],
+                "triplet_unique": len(groups),
+                "max_group": int(max(groups.values())),
+                "top1_share": float(max(groups.values()) / arr.shape[0]),
+                "grad_norm_preclip_mean": float(np.mean(epoch_grad_norms)),
+                "grad_norm_preclip_max": float(np.max(epoch_grad_norms)),
+                **epoch_latent_stats,
+            }
+            self.records["diagnostics"]["per_epoch"].append(diag)
+            self.logger.info(
+                "diag epoch %d: layer_unique %s triplet_unique %d max_group %d "
+                "top1_share %.4f grad_norm %.4f latent_std %.6f" % (
+                    epoch_idx, diag["layer_unique"], diag["triplet_unique"],
+                    diag["max_group"], diag["top1_share"],
+                    diag["grad_norm_preclip_mean"],
+                    diag["latent_per_dim_std_mean"]))
         self.records["epochs"].append({
             "epoch": epoch_idx,
             "wall_sec": round(epoch_time, 3),

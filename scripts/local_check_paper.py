@@ -275,17 +275,131 @@ def check_3_lr_schedule():
           abs(lr_at_step(200000, 0.01, 10000) - 0.01 * math.sqrt(0.05)) < 1e-15)
 
 
+def check_4_kmeans_sources():
+    print("CHECK 4: kmeans init sources (per-layer residuals) and init-once")
+    torch.manual_seed(7)
+    model = RQVAE(in_dim=768, num_emb_list=[256, 256, 256], e_dim=32,
+                  layers=[512, 256, 128], kmeans_init=True)
+    model.train()
+    x = torch.randn(512, 768)
+
+    recorded = []
+    orig_inits = [vq.init_emb for vq in model.rq.vq_layers]
+
+    def make_wrapper(i, orig):
+        def init_emb(data):
+            recorded.append((i, data.detach().clone()))
+            return orig(data)
+        return init_emb
+
+    for i, vq in enumerate(model.rq.vq_layers):
+        vq.init_emb = make_wrapper(i, orig_inits[i])
+
+    model(x)   # first training forward triggers all three inits
+    model(x)   # second training forward must NOT re-init
+    counts = [sum(1 for li, _ in recorded if li == i) for i in range(3)]
+    check("kmeans init called exactly once per layer (over 2 training forwards)",
+          counts == [1, 1, 1], f"counts={counts}")
+
+    # expected init inputs: layer d's kmeans must see the residual entering
+    # layer d for the same batch (post-init codebooks for later layers)
+    with torch.no_grad():
+        z = model.encoder(x)
+        expected = [z]
+        for vq in model.rq.vq_layers[:-1]:
+            d = (expected[-1].pow(2).sum(-1, keepdim=True)
+                 + vq.embedding.weight.pow(2).sum(-1)[None, :]
+                 - 2 * expected[-1] @ vq.embedding.weight.t())
+            q = vq.embedding(d.argmin(-1))
+            expected.append(expected[-1] - q)
+    for i in range(3):
+        got = recorded[i][1]
+        exp = expected[i]
+        check(f"layer {i + 1} kmeans input == residual entering layer {i + 1}",
+              torch.allclose(got, exp, atol=1e-6),
+              f"max|diff|={float((got - exp).abs().max()):.2e}")
+
+
+def check_5_beta_and_loss_graph():
+    print("CHECK 5: beta applied once; loss graph == paper formula (gradient equality)")
+    from models.vq import VectorQuantizer
+    torch.manual_seed(11)
+    x = torch.randn(256, 32)
+    vq = VectorQuantizer(n_e=256, e_dim=32, beta=0.25)
+    vq.initted = True
+    with torch.no_grad():
+        vq.embedding.weight.copy_(torch.randn(256, 32) * 0.05)
+    q, cb, cm, idx = vq(x)
+    d = (x.pow(2).sum(-1, keepdim=True)
+         + vq.embedding.weight.pow(2).sum(-1)[None, :] - 2 * x @ vq.embedding.weight.t())
+    q_ref = vq.embedding.weight[d.argmin(-1)]
+    cb_ref = (q_ref - x).pow(2).sum(-1).mean()
+    cm_ref = 0.25 * (x - q_ref).pow(2).sum(-1).mean()
+    check("codebook loss == ||sg[r]-e||^2 (sum feat, mean batch)",
+          torch.allclose(cb, cb_ref, atol=1e-6))
+    check("commitment == beta*||r-sg[e]||^2 with beta exactly once",
+          torch.allclose(cm, cm_ref, atol=1e-6),
+          f"{float(cm):.6f} vs {float(cm_ref):.6f}")
+
+    # decisive wiring test: the model's training loss graph must produce
+    # encoder/decoder/codebook gradients elementwise identical to the paper
+    # formula computed by hand (recon + sum_d[cb_d + beta*commit_d], one STE)
+    model = make_model(seed=3)
+    xr = torch.randn(64, 768)
+
+    def model_loss(xr):
+        out, ql, _, _ = model(xr)
+        loss, _ = model.compute_loss(out, ql, xs=xr)
+        return loss
+
+    def manual_loss(xr):
+        z = model.encoder(xr)
+        residual, x_q, quant = z, 0, 0
+        for vq in model.rq.vq_layers:
+            d = (residual.pow(2).sum(-1, keepdim=True)
+                 + vq.embedding.weight.pow(2).sum(-1)[None, :]
+                 - 2 * residual @ vq.embedding.weight.t())
+            idx = d.argmin(-1)
+            qq = vq.embedding(idx)
+            quant = (quant + (qq - residual.detach()).pow(2).sum(-1).mean()
+                     + 0.25 * (residual - qq.detach()).pow(2).sum(-1).mean())
+            residual = residual - qq.detach()
+            x_q = x_q + qq
+        z_q = z + (x_q - z).detach()
+        out = model.decoder(z_q)
+        recon = (out - xr).pow(2).sum(-1).mean()
+        return recon + quant
+
+    enc_params = list(model.encoder.parameters())
+    dec_params = list(model.decoder.parameters())
+    cb_params = [vq.embedding.weight for vq in model.rq.vq_layers]
+    g_model = torch.autograd.grad(model_loss(xr), enc_params + dec_params + cb_params)
+    g_manual = torch.autograd.grad(manual_loss(xr), enc_params + dec_params + cb_params)
+    all_ok = True
+    worst = 0.0
+    for a, b in zip(g_model, g_manual):
+        all_ok &= torch.allclose(a, b, atol=1e-6)
+        worst = max(worst, float((a - b).abs().max()))
+    check("gradients of model loss == gradients of hand-written paper formula "
+          "(encoder+decoder+3 codebooks, elementwise)", all_ok, f"max|diff|={worst:.2e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Paper-aligned local checks (CPU)")
     parser.add_argument("--data_dir", type=str,
                         default=str(Path("/home/wlt/Rec/temp/local_check_out/data_dryrun")),
                         help="dir with train/valid.parquet and user_mapping.npy (real Beauty)")
     parser.add_argument("--expect_items", type=int, default=12101)
+    parser.add_argument("--skip_data_checks", action="store_true",
+                        help="run only RQ-VAE / LR checks (no parquet data needed)")
     args = parser.parse_args()
 
     check_1_ste_and_losses()
-    check_2_tokens_and_dataflow(args.data_dir, args.expect_items)
+    if not args.skip_data_checks:
+        check_2_tokens_and_dataflow(args.data_dir, args.expect_items)
     check_3_lr_schedule()
+    check_4_kmeans_sources()
+    check_5_beta_and_loss_graph()
 
     print(f"\n{'ALL CHECKS PASSED' if not FAILURES else 'FAILURES: ' + ', '.join(FAILURES)}")
     sys.exit(1 if FAILURES else 0)
