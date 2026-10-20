@@ -43,6 +43,8 @@ done
 # a couple of per-sample review files for spot checks
 find "${RUN_DIR}/05_reload" -name "*head10.parquet" -size -2M \
   | while read -r p; do cp "${p}" "${AUDIT}/artifacts/"; done
+# full per-sample boolean hit matrix so metrics can be recomputed independently
+[ -f "${RUN_DIR}/05_reload/test_per_sample.npz" ] && cp "${RUN_DIR}/05_reload/test_per_sample.npz" "${AUDIT}/artifacts/"
 
 tar -czf "${OUT_TARBALL}" -C "${WORK}" audit_original_smoke_beauty
 ls -lh "${OUT_TARBALL}"

@@ -5,8 +5,9 @@ branch at the base commit; this script is the real entry point. It rebuilds the
 model from the checkpoint's own config, verifies the checkpoint is bound to
 the same codes file (sha256), evaluates valid/test with both batch-mean and
 sample-weighted metrics, stores per-sample results, and (with --reload_check)
-compares against the save-time reference outputs in <ckpt>_ref.npz: predictions
-must match exactly and logits max|diff| <= 1e-6.
+compares against the save-time reference outputs in <ckpt>_ref.npz: the fixed
+inputs (history, attention mask, labels) must rebuild identically from the
+current data, predictions must match exactly and logits max|diff| <= 1e-6.
 """
 import argparse
 import hashlib
@@ -96,7 +97,11 @@ def reload_check(model, config, save_path, code_path, dataset_path, device, ref_
     loader = GenRecDataLoader(dataset, batch_size=ref_size, shuffle=False)
     rebuilt = loader.collate_fn([dataset[i] for i in range(ref_size)])
     input_ok = (rebuilt['history'].numpy() == ref['input_ids']).all()
-    print(f"fixed inputs rebuilt from current data match reference: {bool(input_ok)}")
+    mask_ok = (rebuilt['attention_mask'].numpy() == ref['attention_mask']).all()
+    labels_ok = (rebuilt['target'].numpy() == ref['labels']).all()
+    fixed_ok = bool(input_ok and mask_ok and labels_ok)
+    print(f"fixed inputs rebuilt from current data match reference: history={bool(input_ok)} "
+          f"mask={bool(mask_ok)} labels={bool(labels_ok)}")
 
     input_ids = torch.from_numpy(ref['input_ids']).to(device)
     attention_mask = torch.from_numpy(ref['attention_mask']).to(device)
@@ -112,16 +117,17 @@ def reload_check(model, config, save_path, code_path, dataset_path, device, ref_
         preds = model.generate(input_ids=input_ids, attention_mask=attention_mask, num_beams=beam_size)
     logits_diff = float(np.abs(logits.detach().cpu().numpy() - ref['logits']).max())
     preds_match = bool((preds.detach().cpu().numpy() == ref['preds']).all())
-    ok = preds_match and logits_diff <= tol
+    ok = preds_match and logits_diff <= tol and fixed_ok
     result = {
         'logits_max_abs_diff': logits_diff,
         'tolerance': tol,
         'predictions_match': preds_match,
-        'fixed_inputs_match_current_data': bool(input_ok),
+        'fixed_inputs_match_current_data': fixed_ok,
+        'fixed_inputs_detail': {'history': bool(input_ok), 'attention_mask': bool(mask_ok), 'labels': bool(labels_ok)},
         'pass': bool(ok),
     }
-    print(f"reload check: logits max|diff|={logits_diff:.3e} (tol {tol:.0e}), preds match={preds_match} -> "
-          f"{'PASS' if ok else 'FAIL'}")
+    print(f"reload check: logits max|diff|={logits_diff:.3e} (tol {tol:.0e}), preds match={preds_match}, "
+          f"fixed inputs match={fixed_ok} -> {'PASS' if ok else 'FAIL'}")
     return result
 
 
