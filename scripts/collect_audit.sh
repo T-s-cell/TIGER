@@ -41,7 +41,7 @@ done
 [ -f "${RUN_DIR}/data/dataset_stats.json" ] && cp "${RUN_DIR}/data/dataset_stats.json" "${AUDIT}/artifacts/"
 
 # a couple of per-sample review files for spot checks
-find "${RUN_DIR}/05_reload" -name "*head10.parquet" -size -1M \
+find "${RUN_DIR}/05_reload" -name "*head10.parquet" -size -2M \
   | while read -r p; do cp "${p}" "${AUDIT}/artifacts/"; done
 
 tar -czf "${OUT_TARBALL}" -C "${WORK}" audit_original_smoke_beauty
